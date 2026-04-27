@@ -1,0 +1,1209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Three-phase pipeline ΔP — Sirona</title>
+
+<!-- Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+<!-- Tailwind Play CDN -->
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- React + Babel only (no Recharts — chart is hand-rolled SVG) -->
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.25.0/babel.min.js"></script>
+
+<style>
+  body { font-family: 'IBM Plex Sans', system-ui, sans-serif; }
+  .font-mono { font-family: 'IBM Plex Mono', monospace; }
+  input[type=number]::-webkit-inner-spin-button,
+  input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  input[type=number] { -moz-appearance: textfield; }
+  #boot {
+    padding: 24px; font-family: 'IBM Plex Mono', monospace; font-size: 13px;
+    color: #475569; line-height: 1.6;
+  }
+  #boot .err { color: #b91c1c; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<div id="root">
+  <div id="boot">
+    Loading calculator…<br/>
+    <span style="color:#94a3b8">If this stays here for more than 10 seconds, your network is blocking unpkg.com or cdn.tailwindcss.com.</span>
+  </div>
+</div>
+
+<script>
+  window.addEventListener('error', function(e) {
+    var b = document.getElementById('boot');
+    if (b) b.innerHTML = '<span class="err">Startup error:\n' + (e.message || e) + '\n\nat ' + (e.filename || '?') + ':' + (e.lineno || '?') + '</span>';
+  });
+  window.addEventListener('unhandledrejection', function(e) {
+    var b = document.getElementById('boot');
+    if (b) b.innerHTML = '<span class="err">Promise rejection:\n' + (e.reason || '') + '</span>';
+  });
+</script>
+
+<script type="text/babel">
+const { useMemo, useState, useEffect, useRef } = React;
+
+const SAT_TABLE = [
+  [0.5,  81.3, 971.8, 0.309, 3.54e-4, 1.115e-5, 0.0626],
+  [1.0,  99.6, 958.4, 0.598, 2.82e-4, 1.227e-5, 0.0589],
+  [1.5, 111.4, 950.0, 0.863, 2.55e-4, 1.275e-5, 0.0563],
+  [2.0, 120.2, 943.1, 1.129, 2.32e-4, 1.297e-5, 0.0548],
+  [3.0, 133.5, 931.8, 1.651, 2.07e-4, 1.346e-5, 0.0521],
+  [4.0, 143.6, 922.9, 2.163, 1.92e-4, 1.379e-5, 0.0500],
+  [5.0, 151.8, 915.3, 2.668, 1.81e-4, 1.412e-5, 0.0482],
+  [7.0, 164.9, 902.9, 3.667, 1.65e-4, 1.466e-5, 0.0454],
+  [10.0,179.9, 887.0, 5.147, 1.50e-4, 1.521e-5, 0.0423],
+  [15.0,198.3, 866.7, 7.596, 1.34e-4, 1.591e-5, 0.0386],
+  [20.0,212.4, 849.8, 10.05, 1.23e-4, 1.643e-5, 0.0357],
+  [25.0,224.0, 834.9, 12.51, 1.15e-4, 1.690e-5, 0.0331],
+  [30.0,233.9, 821.4, 14.99, 1.09e-4, 1.731e-5, 0.0309],
+];
+
+function interp(P, col) {
+  if (P <= SAT_TABLE[0][0]) return SAT_TABLE[0][col];
+  if (P >= SAT_TABLE[SAT_TABLE.length - 1][0]) return SAT_TABLE[SAT_TABLE.length - 1][col];
+  for (let i = 0; i < SAT_TABLE.length - 1; i++) {
+    const P1 = SAT_TABLE[i][0], P2 = SAT_TABLE[i+1][0];
+    if (P >= P1 && P <= P2) {
+      const f = (P - P1) / (P2 - P1);
+      return SAT_TABLE[i][col] + f * (SAT_TABLE[i+1][col] - SAT_TABLE[i][col]);
+    }
+  }
+  return NaN;
+}
+const waterProps = (P_bar) => ({
+  T: interp(P_bar, 1), rho_l: interp(P_bar, 2), rho_g: interp(P_bar, 3),
+  mu_l: interp(P_bar, 4), mu_g: interp(P_bar, 5), sigma: interp(P_bar, 6),
+});
+
+const M_CO2 = 0.04401;
+const M_H2O = 0.01802;
+const R_UNIV = 8.314;
+
+function co2Viscosity(T_K) {
+  const mu0 = 1.48e-5, T0 = 293.15, S = 240;
+  return mu0 * ((T0 + S) / (T_K + S)) * Math.pow(T_K / T0, 1.5);
+}
+
+function gasMixture({ m_co2, m_vap, P_Pa, T_K, mu_vap }) {
+  const m_gas = m_co2 + m_vap;
+  if (m_gas <= 0) return { rho: 1, mu: 1e-5, M: M_H2O, y_co2: 0, y_vap: 1, m_gas: 0 };
+  const n_co2 = m_co2 / M_CO2, n_vap = m_vap / M_H2O;
+  const n_tot = n_co2 + n_vap;
+  const y_co2 = n_co2 / n_tot, y_vap = 1 - y_co2;
+  const M_mix = y_co2 * M_CO2 + y_vap * M_H2O;
+  const rho = (P_Pa * M_mix) / (R_UNIV * T_K);
+  const mu1 = co2Viscosity(T_K), mu2 = mu_vap;
+  const M1 = M_CO2, M2 = M_H2O;
+  const phi = (mui, muj, Mi, Mj) => {
+    const num = Math.pow(1 + Math.sqrt(mui/muj) * Math.pow(Mj/Mi, 0.25), 2);
+    const den = Math.sqrt(8 * (1 + Mi/Mj));
+    return num / den;
+  };
+  const phi12 = phi(mu1, mu2, M1, M2), phi21 = phi(mu2, mu1, M2, M1);
+  const mu_mix = (y_co2 * mu1) / (y_co2 + y_vap * phi12) + (y_vap * mu2) / (y_vap + y_co2 * phi21);
+  return { rho, mu: mu_mix, M: M_mix, y_co2, y_vap, m_gas };
+}
+
+function frictionFactor(Re, rel_roughness) {
+  if (Re < 2300) return 64 / Math.max(Re, 1);
+  const arg = Math.pow(rel_roughness/3.7, 1.11) + 6.9/Re;
+  return 1 / Math.pow(-1.8 * Math.log10(arg), 2);
+}
+
+function homogeneous({ G, x, rho_l, rho_g, mu_l, mu_g, D, eps }) {
+  const v_h = x/rho_g + (1-x)/rho_l;
+  const rho_h = 1 / v_h;
+  const mu_h = 1 / (x/mu_g + (1-x)/mu_l);
+  const Re = (G * D) / mu_h;
+  const f = frictionFactor(Re, eps/D);
+  const dpdz = (f * G * G) / (2 * D * rho_h);
+  return { dpdz, Re, f, rho_h, mu_h };
+}
+
+function lockhartMartinelli({ G, x, rho_l, rho_g, mu_l, mu_g, D, eps }) {
+  const G_l = G * (1-x), G_g = G * x;
+  const Re_l = (G_l * D) / mu_l, Re_g = (G_g * D) / mu_g;
+  const f_l = frictionFactor(Re_l, eps/D), f_g = frictionFactor(Re_g, eps/D);
+  const dp_l = (f_l * G_l * G_l) / (2 * D * rho_l);
+  const dp_g = (f_g * G_g * G_g) / (2 * D * rho_g);
+  const X2 = dp_l / dp_g;
+  const X = Math.sqrt(X2);
+  let C;
+  if (Re_l > 2300 && Re_g > 2300) C = 20;
+  else if (Re_l <= 2300 && Re_g > 2300) C = 12;
+  else if (Re_l > 2300 && Re_g <= 2300) C = 10;
+  else C = 5;
+  const phi_l2 = 1 + C/X + 1/X2;
+  return { dpdz: dp_l * phi_l2, Re_l, Re_g, X, C, phi_l2 };
+}
+
+function friedel({ G, x, rho_l, rho_g, mu_l, mu_g, sigma, D, eps }) {
+  const Re_lo = (G * D) / mu_l, Re_go = (G * D) / mu_g;
+  const f_lo = frictionFactor(Re_lo, eps/D), f_go = frictionFactor(Re_go, eps/D);
+  const dp_lo = (f_lo * G * G) / (2 * D * rho_l);
+  const E = (1-x)**2 + x*x * ((rho_l * f_go) / (rho_g * f_lo));
+  const F = Math.pow(x, 0.78) * Math.pow(1-x, 0.224);
+  const H = Math.pow(rho_l/rho_g, 0.91) * Math.pow(mu_g/mu_l, 0.19) * Math.pow(1 - mu_g/mu_l, 0.7);
+  const v_h = x/rho_g + (1-x)/rho_l;
+  const rho_h = 1 / v_h;
+  const Fr = (G * G) / (9.81 * D * rho_h * rho_h);
+  const We = (G * G * D) / (sigma * rho_h);
+  const phi_lo2 = E + (3.24 * F * H) / (Math.pow(Fr, 0.045) * Math.pow(We, 0.035));
+  return { dpdz: dp_lo * phi_lo2, Re_lo, Re_go, phi_lo2, Fr, We, E, F, H };
+}
+
+function compute(inputs) {
+  const { D_mm, L_m, eps_mm, orientation, P_bar, m_co2, m_sw, x_steam } = inputs;
+  const D = D_mm/1000, eps = eps_mm/1000;
+  const A = (Math.PI * D * D)/4;
+  const P_Pa = P_bar * 1e5;
+  const w = waterProps(P_bar);
+  const T_K = w.T + 273.15;
+  const m_vap = x_steam * m_sw;
+  const m_liq = (1 - x_steam) * m_sw;
+  const m_total = m_co2 + m_sw;
+  const gas = gasMixture({ m_co2, m_vap, P_Pa, T_K, mu_vap: w.mu_g });
+  const x_tot = gas.m_gas / m_total;
+  const G = m_total / A;
+  const v_liq = m_liq / (w.rho_l * A);
+  const v_gas = gas.m_gas / (gas.rho * A);
+  const args = { G, x: x_tot, rho_l: w.rho_l, rho_g: gas.rho, mu_l: w.mu_l, mu_g: gas.mu, D, eps };
+  const hem = homogeneous(args);
+  const lm = lockhartMartinelli(args);
+  const fr = friedel({ ...args, sigma: w.sigma });
+  const angle = { 'horizontal': 0, 'vertical-up': 90, 'vertical-down': -90 }[orientation];
+  const sinTheta = Math.sin(angle * Math.PI/180);
+  const dpdz_grav = hem.rho_h * 9.81 * sinTheta;
+  const wrap = (dpdz_f) => ({
+    dpdz_friction: dpdz_f, dpdz_gravity: dpdz_grav,
+    dpdz_total: dpdz_f + dpdz_grav, dp_total: (dpdz_f + dpdz_grav) * L_m,
+  });
+  return {
+    geom: { D, A, eps_over_D: eps/D, L: L_m, angle },
+    water: w, gas,
+    flow: { m_total, m_vap, m_liq, m_gas: gas.m_gas, x_tot, G, v_liq, v_gas, v_homog: G/hem.rho_h },
+    hem: { ...hem, ...wrap(hem.dpdz) },
+    lm:  { ...lm,  ...wrap(lm.dpdz) },
+    friedel: { ...fr, ...wrap(fr.dpdz) },
+  };
+}
+
+const fmt = (v, d = 3) => {
+  if (v === undefined || v === null || Number.isNaN(v)) return "—";
+  if (v === 0) return "0";
+  const a = Math.abs(v);
+  if (a >= 1e5 || a < 1e-3) return v.toExponential(d);
+  return v.toFixed(d);
+};
+
+const TableToggle = ({ active, onClick }) => (
+  <button
+    type="button"
+    onClick={(e) => { e.preventDefault(); onClick(); }}
+    title={active ? "Hide from cases table" : "Show in cases table"}
+    className={`text-[9px] font-mono tracking-wider px-1.5 py-0.5 rounded border transition uppercase ${
+      active
+        ? "bg-amber-100 text-amber-700 border-amber-300 hover:bg-amber-200"
+        : "bg-slate-50 text-slate-400 border-slate-200 hover:border-slate-400 hover:text-slate-600"
+    }`}>
+    {active ? "▣ in table" : "▢ table"}
+  </button>
+);
+
+const NumberInput = ({ label, unit, value, onChange, step = 1, min, max, inTable, onToggleInTable }) => (
+  <label className="block">
+    <div className="flex items-center justify-between mb-1.5 gap-2">
+      <span className="text-[11px] uppercase tracking-[0.12em] text-slate-500 font-medium">
+        {label} <span className="text-slate-400 normal-case tracking-normal">{unit}</span>
+      </span>
+      {onToggleInTable && <TableToggle active={inTable} onClick={onToggleInTable} />}
+    </div>
+    <input type="number" value={value} step={step} min={min} max={max}
+      onChange={(e) => onChange(parseFloat(e.target.value) || 0)}
+      className="w-full px-3 py-2 bg-white border border-slate-300 rounded-md font-mono text-sm text-slate-900 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition" />
+  </label>
+);
+
+const SelectInput = ({ label, value, onChange, options, inTable, onToggleInTable }) => (
+  <label className="block">
+    <div className="flex items-center justify-between mb-1.5 gap-2">
+      <span className="text-[11px] uppercase tracking-[0.12em] text-slate-500 font-medium">{label}</span>
+      {onToggleInTable && <TableToggle active={inTable} onClick={onToggleInTable} />}
+    </div>
+    <select value={value} onChange={(e) => onChange(e.target.value)}
+      className="w-full px-3 py-2 bg-white border border-slate-300 rounded-md text-sm text-slate-900 focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition">
+      {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+    </select>
+  </label>
+);
+
+const Row = ({ k, v, unit, mono = true, hi = false }) => (
+  <div className="flex items-baseline justify-between py-1.5 border-b border-slate-100 last:border-0">
+    <span className="text-xs text-slate-600">{k}</span>
+    <span className={`${mono ? "font-mono" : ""} text-sm ${hi ? "text-amber-700 font-semibold" : "text-slate-900"}`}>
+      {v} <span className="text-[10px] text-slate-500 ml-0.5">{unit}</span>
+    </span>
+  </div>
+);
+
+const Section = ({ title, subtitle, children }) => (
+  <div className="bg-white border border-slate-200 rounded-lg p-5">
+    <div className="mb-4">
+      <h3 className="text-[11px] uppercase tracking-[0.18em] text-slate-900 font-semibold">{title}</h3>
+      {subtitle && <p className="text-xs text-slate-500 mt-1 font-light">{subtitle}</p>}
+    </div>
+    {children}
+  </div>
+);
+
+const PipeSchematic = ({ x_tot, orientation }) => {
+  const liqFrac = 1 - x_tot;
+  return (
+    <svg viewBox="0 0 320 90" className="w-full h-auto">
+      <defs>
+        <linearGradient id="gasG" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stopColor="#fef3c7" />
+          <stop offset="100%" stopColor="#fde68a" />
+        </linearGradient>
+        <linearGradient id="liqG" x1="0" y1="0" x2="1" y2="0">
+          <stop offset="0%" stopColor="#dbeafe" />
+          <stop offset="100%" stopColor="#bfdbfe" />
+        </linearGradient>
+      </defs>
+      <rect x="20" y="25" width="280" height="40" fill="white" stroke="#475569" strokeWidth="2" />
+      <rect x="22" y="27" width="276" height={36 * x_tot} fill="url(#gasG)" />
+      <rect x="22" y={27 + 36 * x_tot} width="276" height={36 * liqFrac} fill="url(#liqG)" />
+      <line x1="40" y1="45" x2="280" y2="45" stroke="#0f172a" strokeWidth="1" strokeDasharray="4 3" />
+      <polygon points="280,40 290,45 280,50" fill="#0f172a" />
+      <text x="20" y="20" fontSize="9" fill="#64748b" fontFamily="monospace">
+        gas frac (mass): {(x_tot * 100).toFixed(1)}%
+      </text>
+      <text x="20" y="80" fontSize="9" fill="#64748b" fontFamily="monospace">
+        flow direction →   {orientation}
+      </text>
+    </svg>
+  );
+};
+
+const SimpleLineChart = ({ data, series, xKey, xLabel, yLabel, primaryKey }) => {
+  const W = 720, H = 280;
+  const pad = { top: 20, right: 24, bottom: 44, left: 64 };
+  const iw = W - pad.left - pad.right;
+  const ih = H - pad.top - pad.bottom;
+  const xs = data.map(d => d[xKey]);
+  const xMin = Math.min(...xs), xMax = Math.max(...xs);
+  const allYs = data.flatMap(d => series.map(s => d[s.key])).filter(Number.isFinite);
+  let yMin = Math.min(...allYs), yMax = Math.max(...allYs);
+  const yPad = (yMax - yMin) * 0.06 || Math.abs(yMax) * 0.02 || 0.001;
+  yMin -= yPad; yMax += yPad;
+  const xScale = (x) => pad.left + ((x - xMin) / (xMax - xMin || 1)) * iw;
+  const yScale = (y) => pad.top + (1 - (y - yMin) / (yMax - yMin || 1)) * ih;
+  const niceTicks = (lo, hi, n = 5) => {
+    const range = hi - lo;
+    if (range <= 0) return { ticks: [lo], step: 1 };
+    const step0 = range / n;                                   // raw step
+    const step1 = Math.pow(10, Math.floor(Math.log10(step0))); // magnitude
+    const err = step0 / step1;
+    let m;
+    if (err >= 7.07) m = 10;          // sqrt(50)
+    else if (err >= 3.16) m = 5;      // sqrt(10)
+    else if (err >= 1.41) m = 2;      // sqrt(2)
+    else m = 1;
+    const niceStep = m * step1;
+    const start = Math.ceil(lo / niceStep) * niceStep;
+    const ticks = [];
+    for (let v = start; v <= hi + 1e-9; v += niceStep) ticks.push(v);
+    return { ticks, step: niceStep };
+  };
+  const decimalsFor = (step) => Math.max(0, -Math.floor(Math.log10(step) + 1e-9));
+  const xT = niceTicks(xMin, xMax, 6);
+  const yT = niceTicks(yMin, yMax, 5);
+  const xTicks = xT.ticks, yTicks = yT.ticks;
+  const xDecimals = decimalsFor(xT.step);
+  const yDecimals = decimalsFor(yT.step);
+  const buildPath = (key) =>
+    data.map((d, i) => `${i === 0 ? 'M' : 'L'}${xScale(d[xKey]).toFixed(2)},${yScale(d[key]).toFixed(2)}`).join(' ');
+
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+      {yTicks.map((t, i) => (
+        <line key={`gy${i}`} x1={pad.left} y1={yScale(t)} x2={W - pad.right} y2={yScale(t)}
+              stroke="#e2e8f0" strokeWidth="1" strokeDasharray="2 4" />
+      ))}
+      {xTicks.map((t, i) => (
+        <line key={`gx${i}`} x1={xScale(t)} y1={pad.top} x2={xScale(t)} y2={H - pad.bottom}
+              stroke="#e2e8f0" strokeWidth="1" strokeDasharray="2 4" />
+      ))}
+      <line x1={pad.left} y1={pad.top} x2={pad.left} y2={H - pad.bottom} stroke="#94a3b8" />
+      <line x1={pad.left} y1={H - pad.bottom} x2={W - pad.right} y2={H - pad.bottom} stroke="#94a3b8" />
+      {yTicks.map((t, i) => (
+        <g key={`yt${i}`}>
+          <line x1={pad.left - 4} y1={yScale(t)} x2={pad.left} y2={yScale(t)} stroke="#94a3b8" />
+          <text x={pad.left - 8} y={yScale(t) + 4} fontSize="10" fill="#64748b" textAnchor="end">
+            {t.toFixed(yDecimals)}
+          </text>
+        </g>
+      ))}
+      {xTicks.map((t, i) => (
+        <g key={`xt${i}`}>
+          <line x1={xScale(t)} y1={H - pad.bottom} x2={xScale(t)} y2={H - pad.bottom + 4} stroke="#94a3b8" />
+          <text x={xScale(t)} y={H - pad.bottom + 16} fontSize="10" fill="#64748b" textAnchor="middle">
+            {t.toFixed(xDecimals)}
+          </text>
+        </g>
+      ))}
+      <text x={pad.left + iw/2} y={H - 6} fontSize="11" fill="#475569" textAnchor="middle">{xLabel}</text>
+      <text x={14} y={pad.top + ih/2} fontSize="11" fill="#475569" textAnchor="middle"
+            transform={`rotate(-90 14 ${pad.top + ih/2})`}>{yLabel}</text>
+      {series.map(s => (
+        <path key={s.key} d={buildPath(s.key)} fill="none" stroke={s.color}
+              strokeWidth={primaryKey === s.key ? 3 : 1.5}
+              strokeDasharray={primaryKey === s.key ? "" : (s.dashed ? "5 4" : "")} />
+      ))}
+    </svg>
+  );
+};
+
+function PressureDropCalculator() {
+  const [D_mm, setD] = useState(200);
+  const [L_m, setL] = useState(20);
+  const [eps_mm, setEps] = useState(0.05);
+  const [orientation, setOrientation] = useState("horizontal");
+  const [P_bar, setP] = useState(0.7);
+  const [m_co2, setMco2] = useState(0.2);
+  const [m_sw, setMsw] = useState(0.640);
+  const [x_steam, setXsteam] = useState(0.5);
+  const [primary, setPrimary] = useState("friedel");
+
+  // ============== CASES — saved scenarios ==============
+  const STORAGE_KEY = 'pdc_cases_v1';
+  const COLS_KEY = 'pdc_cols_v1';
+
+  const COL_DEFS = {
+    D_mm:        { label: 'D [mm]',        format: (v) => v },
+    L_m:         { label: 'L [m]',         format: (v) => v },
+    eps_mm:      { label: 'ε [mm]',        format: (v) => v },
+    orientation: { label: 'Orientation',   format: (v) => ({horizontal:'horiz.','vertical-up':'vert ↑','vertical-down':'vert ↓'}[v] || v) },
+    P_bar:       { label: 'P [bar]',       format: (v) => v },
+    m_sw:        { label: 'ṁ steam+water [kg/s]', format: (v) => v },
+    m_co2:       { label: 'ṁ CO₂ [kg/s]',  format: (v) => v },
+    x_steam:     { label: 'x steam',       format: (v) => v },
+  };
+
+  const DEFAULT_COLS = {
+    D_mm: true, L_m: false, eps_mm: false, orientation: false,
+    P_bar: true, m_sw: true, m_co2: true, x_steam: true,
+  };
+
+  const [tableColumns, setTableColumns] = useState(() => {
+    try { const s = localStorage.getItem(COLS_KEY); return s ? { ...DEFAULT_COLS, ...JSON.parse(s) } : DEFAULT_COLS; }
+    catch { return DEFAULT_COLS; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(COLS_KEY, JSON.stringify(tableColumns)); } catch {}
+  }, [tableColumns]);
+  const toggleCol = (key) => setTableColumns(c => ({ ...c, [key]: !c[key] }));
+
+  const [cases, setCases] = useState(() => {
+    try { const s = localStorage.getItem(STORAGE_KEY); return s ? JSON.parse(s) : []; }
+    catch { return []; }
+  });
+  const [activeCaseId, setActiveCaseId] = useState(null);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+
+  useEffect(() => {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cases)); } catch {}
+  }, [cases]);
+
+  const currentInputs = { D_mm, L_m, eps_mm, orientation, P_bar, m_co2, m_sw, x_steam };
+
+  const activeCase = activeCaseId ? cases.find(c => c.id === activeCaseId) : null;
+  const isModified = activeCase && JSON.stringify(activeCase.inputs) !== JSON.stringify(currentInputs);
+
+  const saveAsNewCase = () => {
+    const id = Date.now().toString(36);
+    const name = `Case ${cases.length + 1}`;
+    setCases([...cases, { id, name, inputs: currentInputs }]);
+    setActiveCaseId(id);
+  };
+  const updateActiveCase = () => {
+    if (!activeCaseId) return;
+    setCases(cases.map(c => c.id === activeCaseId ? { ...c, inputs: currentInputs } : c));
+  };
+  const loadCase = (id) => {
+    const c = cases.find(c => c.id === id);
+    if (!c) return;
+    const i = c.inputs;
+    setD(i.D_mm); setL(i.L_m); setEps(i.eps_mm); setOrientation(i.orientation);
+    setP(i.P_bar); setMco2(i.m_co2); setMsw(i.m_sw); setXsteam(i.x_steam);
+    setActiveCaseId(id);
+  };
+  const renameCase = (id, name) => {
+    setCases(cases.map(c => c.id === id ? { ...c, name } : c));
+  };
+  const deleteCase = (id) => {
+    setCases(cases.filter(c => c.id !== id));
+    if (activeCaseId === id) setActiveCaseId(null);
+  };
+  const duplicateCase = (id) => {
+    const c = cases.find(c => c.id === id);
+    if (!c) return;
+    const newId = Date.now().toString(36);
+    const newName = `${c.name} (copy)`;
+    setCases([...cases, { id: newId, name: newName, inputs: c.inputs }]);
+  };
+
+  // Compute results for every saved case (for comparison view)
+  const allCaseResults = useMemo(
+    () => cases.map(c => ({ ...c, result: compute(c.inputs) })),
+    [cases]
+  );
+
+  const r = useMemo(
+    () => compute({ D_mm, L_m, eps_mm, orientation, P_bar, m_co2, m_sw, x_steam }),
+    [D_mm, L_m, eps_mm, orientation, P_bar, m_co2, m_sw, x_steam]
+  );
+
+  const profile = useMemo(() => {
+    const N = 50;
+    return Array.from({ length: N + 1 }, (_, i) => {
+      const z = (i / N) * L_m;
+      return {
+        z,
+        Homogeneous: (P_bar * 1e5 - r.hem.dpdz_total * z) / 1e5,
+        LM:          (P_bar * 1e5 - r.lm.dpdz_total * z) / 1e5,
+        Friedel:     (P_bar * 1e5 - r.friedel.dpdz_total * z) / 1e5,
+      };
+    });
+  }, [r, L_m, P_bar]);
+
+  const chosen = r[primary];
+  const dp_kPa = chosen.dp_total / 1000;
+  const dp_bar = chosen.dp_total / 1e5;
+  const primaryChartKey = { hem: "Homogeneous", lm: "LM", friedel: "Friedel" }[primary];
+
+  return (
+    <div className="min-h-screen w-full p-6 md:p-10"
+         style={{ background: "linear-gradient(180deg, #f8fafc 0%, #f1f5f9 100%)", color: "#0f172a" }}>
+      <div className="fixed inset-0 pointer-events-none opacity-40"
+           style={{
+             backgroundImage: "linear-gradient(#cbd5e1 1px, transparent 1px), linear-gradient(90deg, #cbd5e1 1px, transparent 1px)",
+             backgroundSize: "32px 32px",
+             maskImage: "radial-gradient(ellipse at center, black 30%, transparent 80%)",
+           }} />
+      <div className="relative max-w-7xl mx-auto">
+        <header className="mb-8 pb-6 border-b border-slate-300">
+          <div className="flex items-center gap-3">
+            <div className="w-2 h-2 bg-amber-500 rounded-full animate-pulse" />
+            <span className="text-[10px] uppercase tracking-[0.25em] text-slate-500 font-mono">
+              Sirona / fluid dynamics · v2 — multi-case
+            </span>
+          </div>
+          <h1 className="text-4xl md:text-5xl font-semibold mt-3 tracking-tight">
+            Three-phase pipeline <span className="text-amber-600">ΔP</span>
+          </h1>
+          <p className="text-sm text-slate-600 mt-2 font-light max-w-2xl">
+            Steam · liquid water · CO₂ in 304 SS pipe. Saturated water/steam properties from
+            IAPWS-IF97 lookup; gas mixture from Wilke's rule; three-phase modelled as gas mixture
+            (steam + CO₂) over liquid water.
+          </p>
+        </header>
+
+        {/* ============== CASES PANEL ============== */}
+        <div className="bg-white border border-slate-200 rounded-lg p-4 mb-6">
+          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+            <div className="flex items-center gap-3">
+              <h3 className="text-[11px] uppercase tracking-[0.18em] text-slate-900 font-semibold">Saved cases</h3>
+              <span className="text-[11px] text-slate-500 font-mono">
+                {cases.length === 0 ? "none yet" : `${cases.length} saved`}
+                {activeCase && ` · viewing: ${activeCase.name}`}
+                {isModified && <span className="text-amber-600"> (modified)</span>}
+              </span>
+            </div>
+            <div className="flex gap-2 flex-wrap">
+              <button onClick={saveAsNewCase}
+                className="px-3 py-1.5 bg-slate-900 text-white text-xs font-medium rounded hover:bg-slate-700 transition">
+                + Save current
+              </button>
+              {isModified && (
+                <button onClick={updateActiveCase}
+                  className="px-3 py-1.5 bg-amber-500 text-white text-xs font-medium rounded hover:bg-amber-600 transition">
+                  Update "{activeCase.name}"
+                </button>
+              )}
+              {cases.length >= 1 && (
+                <button onClick={() => setShowAdvanced(!showAdvanced)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded border transition ${
+                    showAdvanced
+                      ? "bg-slate-900 text-white border-slate-900"
+                      : "bg-white text-slate-900 border-slate-300 hover:bg-slate-50"
+                  }`}>
+                  {showAdvanced ? "✓ advanced cols" : "+ advanced cols"}
+                </button>
+              )}
+            </div>
+          </div>
+
+          {cases.length === 0 ? (
+            <p className="text-xs text-slate-500 leading-relaxed">
+              Snapshot the current inputs as a named case so you can switch between scenarios and compare side-by-side.
+              Cases persist in your browser's local storage.
+              Use the <span className="font-mono text-amber-700">▣ in table</span> toggle next to each input to control which inputs appear as columns below.
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead>
+                  <tr className="text-[10px] uppercase tracking-[0.15em] text-slate-500 border-b border-slate-200">
+                    <th className="text-left py-2 px-2 font-medium">Case</th>
+                    {Object.entries(COL_DEFS).map(([key, def]) =>
+                      tableColumns[key] && <th key={key} className="text-right py-2 px-2 font-medium whitespace-nowrap">{def.label}</th>
+                    )}
+                    {showAdvanced && (
+                      <>
+                        <th className="text-right py-2 px-2 font-medium border-l border-slate-200 whitespace-nowrap">x_tot [%]</th>
+                        <th className="text-right py-2 px-2 font-medium whitespace-nowrap">v_sg [m/s]</th>
+                        <th className="text-right py-2 px-2 font-medium whitespace-nowrap">v_sl [m/s]</th>
+                      </>
+                    )}
+                    <th className="text-right py-2 px-2 font-medium border-l border-slate-200 whitespace-nowrap">ΔP {primary} [kPa]</th>
+                    {showAdvanced && (
+                      <>
+                        <th className="text-right py-2 px-2 font-medium whitespace-nowrap">ΔP HEM</th>
+                        <th className="text-right py-2 px-2 font-medium whitespace-nowrap">ΔP LM</th>
+                        <th className="text-right py-2 px-2 font-medium whitespace-nowrap">ΔP Friedel</th>
+                      </>
+                    )}
+                    <th className="py-2 px-2 font-medium border-l border-slate-200">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono">
+                  {allCaseResults.map(c => {
+                    const isActive = c.id === activeCaseId;
+                    const dpPrimary = c.result[primary].dp_total / 1000;
+                    return (
+                      <tr key={c.id} className={`border-b border-slate-100 last:border-0 ${isActive ? "bg-amber-50" : "hover:bg-slate-50"}`}>
+                        <td className="py-2 px-2 whitespace-nowrap">
+                          {isActive && <span className="text-amber-600 mr-1.5">●</span>}
+                          <input
+                            type="text"
+                            value={c.name}
+                            onChange={(e) => renameCase(c.id, e.target.value)}
+                            className="bg-transparent border-none outline-none font-semibold text-slate-900 w-32 focus:ring-0 px-0 focus:bg-white focus:border focus:border-amber-300 focus:rounded focus:px-1"
+                            style={{ fontFamily: "inherit" }}
+                          />
+                        </td>
+                        {Object.entries(COL_DEFS).map(([key, def]) =>
+                          tableColumns[key] && (
+                            <td key={key} className="text-right py-2 px-2">{def.format(c.inputs[key])}</td>
+                          )
+                        )}
+                        {showAdvanced && (
+                          <>
+                            <td className="text-right py-2 px-2 border-l border-slate-200">{(c.result.flow.x_tot * 100).toFixed(1)}</td>
+                            <td className="text-right py-2 px-2">{c.result.flow.v_gas.toFixed(1)}</td>
+                            <td className="text-right py-2 px-2">{c.result.flow.v_liq.toFixed(3)}</td>
+                          </>
+                        )}
+                        <td className="text-right py-2 px-2 font-semibold text-slate-900 border-l border-slate-200">
+                          {dpPrimary.toFixed(2)}
+                        </td>
+                        {showAdvanced && (
+                          <>
+                            <td className="text-right py-2 px-2 text-slate-600">{(c.result.hem.dp_total/1000).toFixed(2)}</td>
+                            <td className="text-right py-2 px-2 text-slate-600">{(c.result.lm.dp_total/1000).toFixed(2)}</td>
+                            <td className="text-right py-2 px-2 text-slate-600">{(c.result.friedel.dp_total/1000).toFixed(2)}</td>
+                          </>
+                        )}
+                        <td className="py-2 px-2 text-right border-l border-slate-200 whitespace-nowrap">
+                          {!isActive && (
+                            <button onClick={() => loadCase(c.id)}
+                              className="text-amber-700 hover:text-amber-900 font-medium px-1.5 text-xs">
+                              load
+                            </button>
+                          )}
+                          <button onClick={() => duplicateCase(c.id)}
+                            title="Duplicate"
+                            className="text-slate-400 hover:text-slate-700 px-1.5 text-base leading-none">⧉</button>
+                          <button onClick={() => deleteCase(c.id)}
+                            title="Delete"
+                            className="text-slate-400 hover:text-red-600 px-1.5 text-base leading-none">×</button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+              <p className="text-[10px] text-slate-500 font-mono mt-2 leading-relaxed">
+                ΔP {primary} reflects the currently-selected primary correlation. Toggle <span className="text-amber-700">▣ in table</span> next to any input to add/remove its column. Click a case name to rename.
+              </p>
+            </div>
+          )}
+        </div>
+
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          <div className="lg:col-span-3 space-y-4">
+            <Section title="Pipe geometry" subtitle="304 stainless steel">
+              <div className="space-y-3">
+                <NumberInput label="Inner diameter" unit="mm" value={D_mm} onChange={setD} step={1} min={1}
+                  inTable={tableColumns.D_mm} onToggleInTable={() => toggleCol('D_mm')} />
+                <NumberInput label="Length" unit="m" value={L_m} onChange={setL} step={0.5} min={0}
+                  inTable={tableColumns.L_m} onToggleInTable={() => toggleCol('L_m')} />
+                <NumberInput label="Roughness ε" unit="mm" value={eps_mm} onChange={setEps} step={0.001} min={0}
+                  inTable={tableColumns.eps_mm} onToggleInTable={() => toggleCol('eps_mm')} />
+                <SelectInput label="Orientation" value={orientation} onChange={setOrientation}
+                  inTable={tableColumns.orientation} onToggleInTable={() => toggleCol('orientation')}
+                  options={[
+                    { value: "horizontal", label: "Horizontal" },
+                    { value: "vertical-up", label: "Vertical (upflow)" },
+                    { value: "vertical-down", label: "Vertical (downflow)" },
+                  ]} />
+              </div>
+            </Section>
+            <Section title="Process inputs" subtitle="saturated state">
+              <div className="space-y-3">
+                <NumberInput label="Pressure (abs)" unit="bar" value={P_bar} onChange={setP} step={0.1} min={0.5} max={30}
+                  inTable={tableColumns.P_bar} onToggleInTable={() => toggleCol('P_bar')} />
+                <NumberInput label="ṁ steam + water" unit="kg/s" value={m_sw} onChange={setMsw} step={0.01} min={0}
+                  inTable={tableColumns.m_sw} onToggleInTable={() => toggleCol('m_sw')} />
+                <NumberInput label="ṁ CO₂" unit="kg/s" value={m_co2} onChange={setMco2} step={0.01} min={0}
+                  inTable={tableColumns.m_co2} onToggleInTable={() => toggleCol('m_co2')} />
+                <NumberInput label="Steam quality x" unit="—" value={x_steam} onChange={setXsteam} step={0.01} min={0} max={1}
+                  inTable={tableColumns.x_steam} onToggleInTable={() => toggleCol('x_steam')} />
+              </div>
+            </Section>
+            <Section title="Method">
+              <SelectInput label="Primary correlation" value={primary} onChange={setPrimary}
+                options={[
+                  { value: "friedel", label: "Friedel (recommended)" },
+                  { value: "lm", label: "Lockhart-Martinelli (Chisholm)" },
+                  { value: "hem", label: "Homogeneous (HEM)" },
+                ]} />
+
+              {primary === 'hem' && (
+                <div className="mt-3 p-2.5 bg-amber-50 border-l-2 border-amber-500 text-[11px] text-amber-900 leading-snug">
+                  <span className="font-semibold">⚠ HEM under-predicts</span> in separated flows (annular, stratified, slug). Use only for truly dispersed/bubbly flow. See §04 / §07 of docs.
+                </div>
+              )}
+
+              <div className="mt-4 pt-3 border-t border-slate-200 text-xs text-slate-600">
+                <div className="font-semibold text-[11px] uppercase tracking-[0.12em] text-slate-500 mb-2">When to use</div>
+                <div className="space-y-1.5 leading-snug">
+                  <div>
+                    <span className="font-mono text-amber-700 font-semibold">Friedel</span>
+                    <span className="text-slate-600"> — default; annular & general (typical DAC line)</span>
+                  </div>
+                  <div>
+                    <span className="font-mono text-slate-700 font-semibold">HEM</span>
+                    <span className="text-slate-600"> — only truly dispersed/bubbly (no wall film)</span>
+                  </div>
+                  <div>
+                    <span className="font-mono text-slate-700 font-semibold">LM</span>
+                    <span className="text-slate-600"> — low-P (&lt;7 bar) adiabatic gas + water</span>
+                  </div>
+                </div>
+                <div className="mt-3 pt-2 border-t border-slate-100 text-[11px] leading-snug text-slate-500">
+                  <span className="font-semibold text-slate-700">Cross-check:</span> if all three agree within ±30%, moderate confidence. Divergence &gt;2× → outside valid range. See §07/§09 of docs.
+                </div>
+              </div>
+            </Section>
+          </div>
+
+          <div className="lg:col-span-9 space-y-6">
+            <div className="bg-slate-900 text-white rounded-lg p-6 md:p-8 relative overflow-hidden">
+              <div className="absolute inset-0 opacity-20"
+                   style={{ background: "radial-gradient(circle at 80% 20%, rgba(245,158,11,0.4), transparent 60%)" }} />
+              <div className="relative grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.2em] text-amber-400 font-mono mb-2">
+                    Total ΔP across pipe
+                  </div>
+                  <div className="font-mono text-4xl md:text-5xl font-semibold tabular-nums">
+                    {fmt(dp_kPa, 2)}<span className="text-lg text-slate-400 ml-2">kPa</span>
+                  </div>
+                  <div className="text-xs text-slate-400 mt-2 font-mono">
+                    = {fmt(dp_bar, 4)} bar = {fmt(chosen.dp_total, 1)} Pa
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.2em] text-amber-400 font-mono mb-2">
+                    Pressure gradient
+                  </div>
+                  <div className="font-mono text-3xl font-semibold tabular-nums">
+                    {fmt(chosen.dpdz_total, 1)}<span className="text-base text-slate-400 ml-2">Pa/m</span>
+                  </div>
+                  <div className="text-xs text-slate-400 mt-2 font-mono">
+                    friction: {fmt(chosen.dpdz_friction, 1)} Pa/m · gravity: {fmt(chosen.dpdz_gravity, 1)} Pa/m
+                  </div>
+                </div>
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.2em] text-amber-400 font-mono mb-2">
+                    Outlet pressure
+                  </div>
+                  <div className="font-mono text-3xl font-semibold tabular-nums">
+                    {fmt(P_bar - dp_bar, 4)}<span className="text-base text-slate-400 ml-2">bar</span>
+                  </div>
+                  <div className="text-xs text-slate-400 mt-2 font-mono">
+                    from {fmt(P_bar, 3)} bar inlet · {primary} method
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <div className="md:col-span-2">
+                <Section title="Flow conditions" subtitle={`T_sat = ${fmt(r.water.T,1)} °C at ${fmt(P_bar,2)} bar`}>
+                  <PipeSchematic x_tot={r.flow.x_tot} orientation={orientation} />
+                  <div className="grid grid-cols-2 gap-x-6 mt-4 pt-4 border-t border-slate-100">
+                    <div>
+                      <Row k="Total mass flow" v={fmt(r.flow.m_total, 4)} unit="kg/s" />
+                      <Row k="ṁ liquid water" v={fmt(r.flow.m_liq, 4)} unit="kg/s" />
+                      <Row k="ṁ steam vapour" v={fmt(r.flow.m_vap, 4)} unit="kg/s" />
+                      <Row k="ṁ CO₂" v={fmt(m_co2, 4)} unit="kg/s" />
+                    </div>
+                    <div>
+                      <Row k="Mass flux G" v={fmt(r.flow.G, 1)} unit="kg/m²s" />
+                      <Row k="Total gas-phase frac" v={fmt(r.flow.x_tot * 100, 2)} unit="%" hi />
+                      <Row k="Superficial v_liq" v={fmt(r.flow.v_liq, 3)} unit="m/s" />
+                      <Row k="Superficial v_gas" v={fmt(r.flow.v_gas, 3)} unit="m/s" />
+                    </div>
+                  </div>
+                </Section>
+              </div>
+              <Section title="Geometry" subtitle="derived">
+                <Row k="Inner diameter D" v={fmt(r.geom.D * 1000, 2)} unit="mm" />
+                <Row k="Cross-section A" v={fmt(r.geom.A * 1e4, 3)} unit="cm²" />
+                <Row k="Relative roughness" v={fmt(r.geom.eps_over_D, 5)} unit="—" />
+                <Row k="L/D" v={fmt(r.geom.L / r.geom.D, 1)} unit="—" />
+                <Row k="Inclination" v={fmt(r.geom.angle, 0)} unit="°" />
+              </Section>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              <Section title="Liquid water" subtitle="saturated">
+                <Row k="ρ_l" v={fmt(r.water.rho_l, 1)} unit="kg/m³" />
+                <Row k="μ_l" v={fmt(r.water.mu_l * 1e6, 1)} unit="µPa·s" />
+                <Row k="σ" v={fmt(r.water.sigma * 1000, 2)} unit="mN/m" />
+                <Row k="T_sat" v={fmt(r.water.T, 2)} unit="°C" />
+              </Section>
+              <Section title="Steam vapour" subtitle="saturated">
+                <Row k="ρ_g (pure steam)" v={fmt(r.water.rho_g, 3)} unit="kg/m³" />
+                <Row k="μ_g (pure steam)" v={fmt(r.water.mu_g * 1e6, 2)} unit="µPa·s" />
+                <Row k="M (water)" v="18.02" unit="g/mol" />
+              </Section>
+              <Section title="Gas mixture" subtitle="steam + CO₂ (Wilke)">
+                <Row k="ρ_mix" v={fmt(r.gas.rho, 3)} unit="kg/m³" hi />
+                <Row k="μ_mix" v={fmt(r.gas.mu * 1e6, 2)} unit="µPa·s" hi />
+                <Row k="M_mix" v={fmt(r.gas.M * 1000, 2)} unit="g/mol" />
+                <Row k="y_CO₂ (mol)" v={fmt(r.gas.y_co2, 3)} unit="—" />
+                <Row k="y_H₂O (mol)" v={fmt(r.gas.y_vap, 3)} unit="—" />
+              </Section>
+            </div>
+
+            <Section title="Correlation comparison" subtitle="all values for full pipe length L">
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-[10px] uppercase tracking-[0.15em] text-slate-500">
+                      <th className="text-left py-2 font-medium">Method</th>
+                      <th className="text-right py-2 font-medium">dP/dz friction</th>
+                      <th className="text-right py-2 font-medium">dP/dz gravity</th>
+                      <th className="text-right py-2 font-medium">dP/dz total</th>
+                      <th className="text-right py-2 font-medium">ΔP total</th>
+                      <th className="text-right py-2 font-medium">Δ vs primary</th>
+                    </tr>
+                  </thead>
+                  <tbody className="font-mono">
+                    {[
+                      ["Homogeneous (HEM)", "hem", r.hem],
+                      ["Lockhart-Martinelli", "lm", r.lm],
+                      ["Friedel", "friedel", r.friedel],
+                    ].map(([name, key, m]) => (
+                      <tr key={key} className={`border-t border-slate-100 ${primary === key ? "bg-amber-50" : ""}`}>
+                        <td className="py-2 text-slate-700">
+                          {primary === key && <span className="text-amber-600 mr-2">●</span>}
+                          {name}
+                        </td>
+                        <td className="text-right py-2">{fmt(m.dpdz_friction, 1)} Pa/m</td>
+                        <td className="text-right py-2">{fmt(m.dpdz_gravity, 1)} Pa/m</td>
+                        <td className="text-right py-2">{fmt(m.dpdz_total, 1)} Pa/m</td>
+                        <td className="text-right py-2 font-semibold text-slate-900">{fmt(m.dp_total/1000, 2)} kPa</td>
+                        <td className="text-right py-2 text-slate-500">
+                          {primary === key ? "—" : `${(((m.dp_total - chosen.dp_total) / chosen.dp_total) * 100).toFixed(1)} %`}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="mt-4 pt-4 border-t border-slate-100 grid grid-cols-2 md:grid-cols-4 gap-x-4 gap-y-1 text-xs font-mono">
+                <span className="text-slate-500">HEM Re:</span><span>{fmt(r.hem.Re, 0)}</span>
+                <span className="text-slate-500">HEM f:</span><span>{fmt(r.hem.f, 4)}</span>
+                <span className="text-slate-500">LM Re_l:</span><span>{fmt(r.lm.Re_l, 0)}</span>
+                <span className="text-slate-500">LM Re_g:</span><span>{fmt(r.lm.Re_g, 0)}</span>
+                <span className="text-slate-500">LM X:</span><span>{fmt(r.lm.X, 3)}</span>
+                <span className="text-slate-500">LM C:</span><span>{fmt(r.lm.C, 0)}</span>
+                <span className="text-slate-500">Friedel φ²_lo:</span><span>{fmt(r.friedel.phi_lo2, 2)}</span>
+                <span className="text-slate-500">Friedel Fr / We:</span><span>{fmt(r.friedel.Fr, 2)} / {fmt(r.friedel.We, 0)}</span>
+              </div>
+            </Section>
+
+            <Section title="Pressure profile along pipe" subtitle="static pressure vs distance from inlet">
+              <SimpleLineChart data={profile} xKey="z" xLabel="distance z [m]" yLabel="P [bar]"
+                primaryKey={primaryChartKey}
+                series={[
+                  { key: "Friedel",     color: "#d97706" },
+                  { key: "LM",          color: "#0369a1" },
+                  { key: "Homogeneous", color: "#475569", dashed: true },
+                ]} />
+              <div className="flex gap-4 text-xs font-mono mt-2 text-slate-600">
+                <span><span className="inline-block w-3 h-0.5 bg-amber-600 align-middle mr-1" />Friedel</span>
+                <span><span className="inline-block w-3 h-0.5 bg-sky-700 align-middle mr-1" />Lockhart-Martinelli</span>
+                <span><span className="inline-block w-3 h-0.5 bg-slate-600 align-middle mr-1" />Homogeneous</span>
+              </div>
+            </Section>
+
+            <Section title="Documentation" subtitle="theoretical background, assumptions and validity ranges of every model used">
+              <div className="space-y-2 text-sm text-slate-700 leading-relaxed">
+
+                {/* === 1. Modelling philosophy === */}
+                <details className="group border-b border-slate-100 pb-3">
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">01</span><span className="font-semibold">Modelling philosophy &amp; reduction of three-phase to two-phase</span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-2 text-slate-600">
+                    <p>The flow contains three components — liquid water, water vapour (steam) and CO₂ — but only two phases (liquid, gas). The tool reduces to a two-phase problem by combining steam vapour and CO₂ into a single homogeneous gas phase, then applies a classical two-phase ΔP correlation between this combined gas and the liquid water.</p>
+                    <p><span className="font-semibold text-slate-900">This reduction is exact when:</span> the two gases are well-mixed (homogeneous gas-phase composition), CO₂ does not condense out, and CO₂ does not dissolve significantly into the liquid water.</p>
+                    <p><span className="font-semibold text-slate-900">When it breaks:</span></p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>Cold sections where CO₂ might form hydrates or condense (T &lt; ~5°C and P &gt; ~10 bar) — not relevant for steam systems.</li>
+                      <li>Long residence time at moderate pressure where CO₂ dissolution becomes significant. Henry's law gives mol(CO₂)/mol(H₂O) ≈ k·P_CO₂; at typical conditions (1 bar partial pressure, 100°C), the equilibrium liquid loading is ~2×10⁻⁴ mole fraction, removing &lt;1% of the CO₂ stream. Safe to neglect.</li>
+                      <li>Within ~10·D downstream of an injection point where the gases haven't yet mixed at molecular scale.</li>
+                    </ul>
+                    <p>The composition of the combined gas phase strongly affects the answer. When you change <span className="font-mono">x_steam</span>, the CO₂ stays in the gas phase but the steam vapour fraction changes — this changes y_CO₂ and y_H₂O, which changes ρ_mix and μ_mix. The tool computes this correctly; the <span className="font-mono">total gas-phase fraction x_tot</span> shown in <em>Flow conditions</em> is what feeds the two-phase correlation.</p>
+                  </div>
+                </details>
+
+                {/* === 2. Property models === */}
+                <details className="group border-b border-slate-100 pb-3">
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">02</span><span className="font-semibold">Property models — water, steam, CO₂, gas mixture</span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-3 text-slate-600">
+                    <div>
+                      <p className="font-semibold text-slate-900">2.1 Saturated water and steam — IAPWS-IF97 lookup</p>
+                      <p>Tabulated saturated liquid and vapour properties (ρ_l, ρ_g, μ_l, μ_g, σ) as functions of pressure, taken from the IAPWS Industrial Formulation 1997. Linear interpolation between tabulated entries.</p>
+                      <ul className="list-disc pl-5 space-y-1 mt-1">
+                        <li><span className="font-mono">Range:</span> 0.5 to 30 bar absolute (T_sat = 81 to 234 °C). Outside range → values clamp to endpoints.</li>
+                        <li><span className="font-mono">Accuracy:</span> linear interpolation introduces &lt;1% error vs. full IAPWS-IF97 for these smoothly-varying quantities.</li>
+                        <li><span className="font-mono">Assumption:</span> liquid water is at saturation. Significant subcooling (e.g. &gt;10°C below T_sat) makes ρ_l and μ_l slightly off but error stays &lt;2%.</li>
+                      </ul>
+                    </div>
+                    <div>
+                      <p className="font-semibold text-slate-900">2.2 CO₂ — ideal gas + Sutherland viscosity</p>
+                      <p className="font-mono text-xs">ρ = P · M_CO₂ / (Z · R · T), with small empirical Z correction (≈ 0.99)<br/>
+                      μ = μ₀ · ((T₀+S)/(T+S)) · (T/T₀)^1.5, with μ₀ = 14.8 µPa·s at T₀ = 293.15 K, S = 240 K</p>
+                      <p>Ideal gas is fine for CO₂ at P &lt; ~30 bar and T &gt; 100 °C (typical DAC desorber/condenser range). Near the critical point (74 bar, 31°C) you need a real-gas EoS like Span-Wagner.</p>
+                    </div>
+                    <div>
+                      <p className="font-semibold text-slate-900">2.3 Gas-phase mixture — Wilke's rule</p>
+                      <p className="font-mono text-xs">μ_mix = Σᵢ (yᵢ · μᵢ) / (Σⱼ yⱼ · φᵢⱼ)<br/>
+                      φᵢⱼ = (1 + (μᵢ/μⱼ)^0.5 · (Mⱼ/Mᵢ)^0.25)² / √(8·(1 + Mᵢ/Mⱼ))</p>
+                      <p>Standard method for low-pressure gas mixtures of nonpolar/weakly polar species. Steam is polar, which makes Wilke slightly less accurate than for purely nonpolar mixtures: expect 5–10% error for steam/CO₂ vs 1–3% for nonpolar mixtures. Density of the mixture uses ideal-gas additivity: M_mix = y_CO₂·M_CO₂ + y_H₂O·M_H₂O, then ρ_mix = P·M_mix/(R·T). For higher accuracy in the viscosity, the Brokaw modification (1958) corrects for polar interactions — let me know if you want it added.</p>
+                    </div>
+                  </div>
+                </details>
+
+                {/* === 3. Friction factor === */}
+                <details className="group border-b border-slate-100 pb-3">
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">03</span><span className="font-semibold">Single-phase friction factor — Haaland (1983)</span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-2 text-slate-600">
+                    <p className="font-mono text-xs">f = [ −1.8 · log₁₀( (ε/D / 3.7)^1.11 + 6.9/Re ) ]⁻²</p>
+                    <p>Explicit approximation to the implicit Colebrook-White equation. Used internally by all three two-phase correlations (each correlation calls it with different definitions of Re and a mass flux — total, total-as-liquid, or single-phase).</p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li><span className="font-mono">Accuracy:</span> within 1.5% of Colebrook for Re &gt; 4000.</li>
+                      <li><span className="font-mono">Range:</span> turbulent flow (Re &gt; 2300 in this tool).</li>
+                      <li><span className="font-mono">Transitional (2300 &lt; Re &lt; 4000):</span> uses Haaland but uncertainty is higher; prefer to design out of this regime when possible.</li>
+                      <li><span className="font-mono">Laminar (Re &lt; 2300):</span> falls back to f = 64/Re (Hagen-Poiseuille).</li>
+                      <li><span className="font-mono">304 SS roughness:</span> 0.015 mm (default) is clean drawn / mill-finish welded; 0.045 mm for general commercial pipe; 0.1+ mm for fouled service.</li>
+                    </ul>
+                  </div>
+                </details>
+
+                {/* === 4. HEM === */}
+                <details className="group border-b border-slate-100 pb-3">
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">04</span><span className="font-semibold">Two-phase #1 — Homogeneous Equilibrium Model (HEM)</span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-2 text-slate-600">
+                    <div className="bg-amber-50 border-l-4 border-amber-500 p-3 text-xs text-amber-900">
+                      <span className="font-semibold">⚠ Bias warning —</span> HEM systematically <strong>under-predicts</strong> ΔP in separated regimes (annular, stratified, slug). For typical DAC steam-line conditions (high v_sg, low v_sl, horizontal pipe → annular), HEM can be 30–100% below Friedel. Do not use HEM for "the reactor outlet line is just gas at some density" simplifications — see §07 below.
+                    </div>
+                    <p><span className="font-semibold text-slate-900">Concept:</span> treat the two-phase mixture as a single pseudo-fluid with averaged density and viscosity. Both phases assumed to move at the same velocity (no slip).</p>
+                    <p className="font-mono text-xs">ρ_h = [ x/ρ_g + (1−x)/ρ_l ]⁻¹<br/>
+                    μ_h = [ x/μ_g + (1−x)/μ_l ]⁻¹     (McAdams)<br/>
+                    Re_h = G · D / μ_h<br/>
+                    (dP/dz)_friction = f(Re_h) · G² / (2 · D · ρ_h)</p>
+                    <p><span className="font-semibold text-slate-900">Best for:</span></p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>Bubbly or finely dispersed flow regimes</li>
+                      <li>High mass flux (G &gt; 2000 kg/m²·s) where slip is small</li>
+                      <li>High pressure (close to critical) where ρ_l/ρ_g is small</li>
+                      <li>Quick first-order estimates and sanity checks</li>
+                    </ul>
+                    <p><span className="font-semibold text-slate-900">Avoid for:</span></p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>Stratified, slug, or annular flow (slip ratio is large)</li>
+                      <li>Low pressure / low quality where ρ_l ≫ ρ_g (large density ratio drives large slip)</li>
+                      <li>Long pipes where phase distribution evolves significantly</li>
+                    </ul>
+                    <p><span className="font-semibold text-slate-900">Accuracy:</span> ±50% typical, with a downward bias. Can be much worse in stratified or annular regimes.</p>
+                  </div>
+                </details>
+
+                {/* === 5. LM === */}
+                <details className="group border-b border-slate-100 pb-3">
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">05</span><span className="font-semibold">Two-phase #2 — Lockhart-Martinelli (1949) with Chisholm constant (1967)</span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-2 text-slate-600">
+                    <p><span className="font-semibold text-slate-900">Concept:</span> compute the pressure drop each phase would have if it were flowing alone in the pipe, then apply a two-phase multiplier to the liquid-only ΔP.</p>
+                    <p className="font-mono text-xs">X² = (dP/dz)_l_only / (dP/dz)_g_only       Martinelli parameter<br/>
+                    φ_l² = 1 + C/X + 1/X²                       Chisholm form<br/>
+                    (dP/dz)_TP = (dP/dz)_l_only · φ_l²</p>
+                    <p>Chisholm's constant C depends on the flow regime of each phase:</p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>Both turbulent: C = 20</li>
+                      <li>Liquid laminar, gas turbulent: C = 12</li>
+                      <li>Liquid turbulent, gas laminar: C = 10</li>
+                      <li>Both laminar: C = 5</li>
+                    </ul>
+                    <p><span className="font-semibold text-slate-900">Best for:</span> adiabatic gas-liquid flow (the original LM database was air-water at 1 atm), wide range of qualities (0.001 to 0.99), low-pressure systems (&lt; 7 bar).</p>
+                    <p><span className="font-semibold text-slate-900">Avoid for:</span></p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>High mass flux / high-pressure systems (Friedel does better)</li>
+                      <li>Boiling or condensing flows (LM is adiabatic-only)</li>
+                      <li>Very high quality (x &gt; 0.95) — switch to a vapour-only friction factor</li>
+                    </ul>
+                    <p><span className="font-semibold text-slate-900">Accuracy:</span> ±30–50% within original air-water database; degrades meaningfully outside.</p>
+                  </div>
+                </details>
+
+                {/* === 6. Friedel === */}
+                <details className="group border-b border-slate-100 pb-3" open>
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">06</span><span className="font-semibold">Two-phase #3 — Friedel (1979) <span className="text-amber-600 font-normal">[default]</span></span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-2 text-slate-600">
+                    <p><span className="font-semibold text-slate-900">Concept:</span> start from the all-liquid pressure drop assuming the total mass flux flows as liquid, then multiply by a factor depending on density and viscosity ratios, plus dimensionless Froude and Weber numbers to capture gravitational and surface-tension effects.</p>
+                    <p className="font-mono text-xs">(dP/dz)_TP = (dP/dz)_lo · φ_lo²<br/>
+                    φ_lo² = E + 3.24 · F · H / ( Fr^0.045 · We^0.035 )<br/><br/>
+                    E = (1−x)² + x² · (ρ_l · f_go) / (ρ_g · f_lo)<br/>
+                    F = x^0.78 · (1−x)^0.224<br/>
+                    H = (ρ_l/ρ_g)^0.91 · (μ_g/μ_l)^0.19 · (1 − μ_g/μ_l)^0.7<br/>
+                    Fr = G² / (g · D · ρ_h²)         Froude (homogeneous density)<br/>
+                    We = G² · D / (σ · ρ_h)           Weber</p>
+                    <p><span className="font-semibold text-slate-900">Best for:</span></p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>Steam/water systems specifically (largely calibrated against this)</li>
+                      <li>Wide range of operating conditions: 0.001 &lt; x &lt; 1, mass fluxes 4 to 10 000 kg/m²·s</li>
+                      <li>Both vertical and horizontal flow (Fr captures gravitational effects)</li>
+                      <li>Conditions where μ_l/μ_g &lt; 1000 (per Whalley) — always true for steam/water</li>
+                    </ul>
+                    <p><span className="font-semibold text-slate-900">Avoid for:</span></p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>Very viscous liquids (μ_l/μ_g &gt; 1000) → use Müller-Steinhagen-Heck or Chisholm B</li>
+                      <li>Microchannels (D &lt; 1 mm) — surface tension changes the underlying physics</li>
+                      <li>Mixtures with very different surface tension or wettability than water</li>
+                    </ul>
+                    <p><span className="font-semibold text-slate-900">Accuracy:</span> ±30% typical for water/steam. Widely regarded as the best general-purpose two-phase ΔP correlation.</p>
+                    <p><span className="font-semibold text-slate-900">Why default here:</span> calibrated against the largest available steam/water database, includes proper Fr/We dependence, recommended in ESDU and HEDH (Heat Exchanger Design Handbook) for general two-phase flow when μ_l/μ_g &lt; 1000 — which always holds for steam/water systems.</p>
+                  </div>
+                </details>
+
+                {/* === 7. Mixing, regimes, and homogeneous limits === */}
+                <details className="group border-b border-slate-100 pb-3">
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">07</span><span className="font-semibold">Mixing, flow regimes, and the limits of "treat it as gas"</span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-3 text-slate-600">
+                    <p>"Is the flow mixed?" is two separate questions, with different answers and different consequences for ΔP. Conflating them is the most common mistake when applying these correlations.</p>
+
+                    <div>
+                      <p className="font-semibold text-slate-900">Question 1 — gas-phase compositional mixing (CO₂ + steam vapour)</p>
+                      <p>Are the two gases distributed uniformly across the pipe cross-section? This affects whether ρ_mix and μ_mix from Wilke's rule (§02.3) actually represent the local gas state.</p>
+                      <p><span className="font-semibold">For DAC reactor outlet:</span> yes, almost certainly mixed. The sorbent bed is a tortuous-path mixer that effectively homogenises the gas-phase composition before the stream exits. The "10·D after a tee" caveat does NOT apply here — that's for stream-injection geometries, not for gases generated together inside a packed bed. Within the first metre of pipe downstream of the bed, treat y_CO₂ as uniform.</p>
+                    </div>
+
+                    <div>
+                      <p className="font-semibold text-slate-900">Question 2 — liquid/gas distribution (the flow regime)</p>
+                      <p>Are the liquid water and gas phases dispersed (homogeneous-ish), or separated (annular, stratified, slug)? This is what actually drives the choice between HEM and Friedel.</p>
+                      <p><span className="font-semibold">For DAC reactor outlet:</span> almost never homogeneous. The bed homogenises gas composition; it does NOT keep liquid droplets dispersed against gravity. Once the mixture leaves the bed and enters straight pipe, hydrodynamics take over: the flow relaxes to whatever regime the local v_sl and v_sg dictate, typically within 50–100·D of the reactor exit.</p>
+                    </div>
+
+                    <div>
+                      <p className="font-semibold text-slate-900">Estimating the regime — Mandhane map for horizontal pipe</p>
+                      <p>Compute the two superficial velocities (the calculator shows these in <em>Flow conditions</em>):</p>
+                      <p className="font-mono text-xs">v_sl = ṁ_liq / (ρ_l · A)        v_sg = ṁ_gas / (ρ_gas · A)</p>
+                      <p>Approximate horizontal-pipe regimes (Mandhane et al. 1974):</p>
+                      <ul className="list-disc pl-5 space-y-1">
+                        <li>v_sg &lt; 0.5 m/s &amp; v_sl &gt; 0.5 m/s → bubbly or plug flow (HEM-friendly)</li>
+                        <li>v_sg &lt; 5 m/s &amp; v_sl &lt; 0.1 m/s → stratified (HEM very wrong)</li>
+                        <li>v_sg 1–10 m/s &amp; v_sl 0.1–1 m/s → slug or wavy (HEM modestly wrong)</li>
+                        <li>v_sg &gt; 10 m/s &amp; v_sl &lt; 0.5 m/s → <strong>annular</strong> (HEM significantly under-predicts; <strong>typical DAC line condition</strong>)</li>
+                        <li>v_sg &gt; 30 m/s &amp; v_sl &gt; 0.5 m/s → annular-mist or dispersed (Friedel is reliable)</li>
+                      </ul>
+                      <p>For vertical upflow, use the Hewitt-Roberts map; the same logic applies: low v_sl + high v_sg → annular.</p>
+                    </div>
+
+                    <div>
+                      <p className="font-semibold text-slate-900">What goes wrong if you assume "homogeneous" when it isn't</p>
+                      <p>HEM treats the mixture as a pseudo-fluid with uniform properties and no slip between phases. Two physical effects are missed in separated flows:</p>
+                      <ol className="list-decimal pl-5 space-y-1">
+                        <li><strong>Slip ratio.</strong> In annular flow, gas in the core moves much faster than the liquid film on the wall — the slip ratio S = v_g/v_l is typically 5–50. The actual gas-core velocity is much higher than HEM's homogeneous v_h, which raises the kinetic energy loss term and the wall-shear term significantly.</li>
+                        <li><strong>Wave roughness.</strong> The gas does not flow over a smooth steel wall; it flows over a wavy liquid film whose effective roughness can be 100–1000× larger than ε of clean 304 SS. This makes the effective friction factor much larger than HEM (which uses pipe roughness) computes.</li>
+                      </ol>
+                      <p>Friedel implicitly captures both effects through the φ²_lo multiplier, which was calibrated against ~25 000 data points across all flow regimes. Lockhart-Martinelli partially captures them via the Chisholm constant.</p>
+                    </div>
+
+                    <div>
+                      <p className="font-semibold text-slate-900">Quantitative example — typical DAC line</p>
+                      <p>For default conditions (D=200 mm, P=0.7 bar, ṁ_sw=0.64 kg/s, x=0.5, ṁ_CO₂=0.2 kg/s):</p>
+                      <ul className="list-disc pl-5 space-y-1">
+                        <li>v_sl ≈ 0.011 m/s, v_sg ≈ 30 m/s → annular</li>
+                        <li>HEM under-predicts ΔP relative to Friedel; the gap visible in the Correlation Comparison panel is the magnitude of the slip + wave-roughness effects you'd be missing</li>
+                      </ul>
+                      <p>For higher gas velocity, lower mass flux, or smaller pipe, the gap grows.</p>
+                    </div>
+
+                    <div>
+                      <p className="font-semibold text-slate-900">"Can I just treat it as gas at some density?"</p>
+                      <p>Two interpretations of this simplification:</p>
+                      <ul className="list-disc pl-5 space-y-1">
+                        <li><strong>HEM (mixture density ρ_h, total mass flux):</strong> what the tool's "Homogeneous" option does. Under-predicts in separated flows. Not recommended for sizing.</li>
+                        <li><strong>Gas-only flow at gas density ρ_g and gas-only mass flux:</strong> ignores the liquid film entirely. Gives a strict <em>lower bound</em> on ΔP. Useful as a sanity reference, not for design.</li>
+                      </ul>
+                      <p>Neither captures the real physics of annular flow. For sizing your 20 m line: use Friedel and apply a 1.3–1.5× design margin to wrap the ±30% Friedel uncertainty plus the fact that you don't have a regime check in the loop.</p>
+                    </div>
+
+                    <div>
+                      <p className="font-semibold text-slate-900">Two further development lengths worth knowing about</p>
+                      <ul className="list-disc pl-5 space-y-1">
+                        <li><strong>Hydrodynamic entrance length:</strong> L_e/D ≈ 4.4·Re^(1/6) (~30·D at Re=10⁵). Friction correlations assume fully developed turbulent profile.</li>
+                        <li><strong>Two-phase flow regime development:</strong> 50–200·D after a flow disturbance for the regime to stabilise. For your 20 m / 80 mm pipe (L/D = 250) this is borderline — the flow is "developing" for most of the line if there's a sharp expansion or bend at the reactor exit. Friedel's accuracy degrades modestly in developing flow.</li>
+                      </ul>
+                    </div>
+                  </div>
+                </details>
+
+                {/* === 8. Pressure gradient components === */}
+                <details className="group border-b border-slate-100 pb-3">
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">08</span><span className="font-semibold">Pressure gradient components — what's included, what's omitted</span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-2 text-slate-600">
+                    <p className="font-mono text-xs">(dP/dz)_total = (dP/dz)_friction + (dP/dz)_gravity + (dP/dz)_acceleration</p>
+                    <p><span className="font-semibold text-slate-900">Friction —</span> from the chosen two-phase correlation above.</p>
+                    <p><span className="font-semibold text-slate-900">Gravity —</span> (dP/dz)_grav = ρ_h · g · sin θ. Uses homogeneous density ρ_h with no void-fraction correction. For more accurate vertical flows, the Rouhani-Axelsson void fraction would give a slightly different mixture density (typically 5–10% off on the gravity term, which is usually a small fraction of total ΔP unless the pipe is purely vertical with low mass flux).</p>
+                    <p><span className="font-semibold text-slate-900">Acceleration — NOT included.</span> This term arises when the mixture density changes along the pipe (boiling, condensation, or significant ΔP expanding the gas):</p>
+                    <p className="font-mono text-xs">(dP/dz)_acc = G² · d(v_h)/dz</p>
+                    <p>Omission is OK when <strong>all</strong> of the following hold:</p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>Pipe is short (L/D &lt; ~500)</li>
+                      <li>Total ΔP is small relative to inlet pressure (ΔP/P &lt; ~10%)</li>
+                      <li>No significant phase change along the pipe (no boiling/condensation)</li>
+                    </ul>
+                    <p>For a long pipe with significant ΔP, the rigorous approach is to integrate dP/dz along the pipe, recomputing properties at each step. The current tool gives a <em>linear</em> approximation that holds only when properties don't change much along the run.</p>
+                  </div>
+                </details>
+
+                {/* === 9. Practical guidance === */}
+                <details className="group border-b border-slate-100 pb-3">
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">09</span><span className="font-semibold">Practical guidance — choosing a correlation and interpreting results</span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-2 text-slate-600">
+                    <table className="w-full text-xs border border-slate-200 my-2">
+                      <thead className="bg-slate-50">
+                        <tr>
+                          <th className="text-left p-2 border-b border-slate-200">Scenario</th>
+                          <th className="text-left p-2 border-b border-slate-200">Recommended correlation</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <tr><td className="p-2 border-b border-slate-100">Default / general use</td><td className="p-2 border-b border-slate-100 font-semibold text-amber-700">Friedel</td></tr>
+                        <tr><td className="p-2 border-b border-slate-100">Quick sanity check, dispersed/bubbly flow</td><td className="p-2 border-b border-slate-100">HEM</td></tr>
+                        <tr><td className="p-2 border-b border-slate-100">Low-pressure (&lt; 7 bar) air/gas + water</td><td className="p-2 border-b border-slate-100">Lockhart-Martinelli</td></tr>
+                        <tr><td className="p-2 border-b border-slate-100">Boiling or condensing inside the pipe</td><td className="p-2 border-b border-slate-100">Friedel (degraded accuracy)</td></tr>
+                        <tr><td className="p-2 border-b border-slate-100">Very viscous liquids</td><td className="p-2 border-b border-slate-100">None of these — use Müller-Steinhagen-Heck</td></tr>
+                        <tr><td className="p-2">Long pipe, large ΔP</td><td className="p-2">Need integration along pipe</td></tr>
+                      </tbody>
+                    </table>
+                    <p><span className="font-semibold text-slate-900">Cross-checking:</span> if HEM, LM, and Friedel agree within ±30%, you can have moderate confidence. If they diverge by more than 2×, you're likely outside their valid range. Most common culprits:</p>
+                    <ul className="list-disc pl-5 space-y-1">
+                      <li>Very low gas-phase fraction (x_tot &lt; ~0.01) where the gas barely forms a continuous phase</li>
+                      <li>Very high gas fraction (x_tot &gt; 0.95) where the liquid film is the limiting flow feature</li>
+                      <li>Large density ratio combined with low mass flux → strong slip, HEM diverges from LM/Friedel</li>
+                    </ul>
+                    <p><span className="font-semibold text-slate-900">Flow regime hint —</span> the tool doesn't currently identify the flow regime (bubbly / slug / annular / stratified). For horizontal pipe with a high gas fraction and low liquid mass flux, flow is likely stratified or annular, where Friedel is most reliable. Vertical upflow at high mass flux tends toward dispersed bubble or churn → HEM and Friedel both work. If you'd like a Baker or Mandhane regime map overlaid, it's a quick add.</p>
+                  </div>
+                </details>
+
+                {/* === 10. References === */}
+                <details className="group">
+                  <summary className="cursor-pointer list-none flex items-center justify-between py-1 hover:text-amber-700 transition">
+                    <span><span className="text-slate-400 font-mono mr-2">10</span><span className="font-semibold">References</span></span>
+                    <span className="text-slate-400 group-open:rotate-90 transition-transform">▶</span>
+                  </summary>
+                  <div className="mt-3 pl-6 border-l-2 border-amber-200 space-y-1 text-slate-600 text-xs font-mono leading-relaxed">
+                    <p>Friedel, L. (1979). "Improved friction pressure drop correlation for horizontal and vertical two-phase pipe flow." European Two-Phase Flow Group Meeting, Ispra, Italy, Paper E2.</p>
+                    <p>Lockhart, R. W., Martinelli, R. C. (1949). "Proposed correlation of data for isothermal two-phase, two-component flow in pipes." Chem. Eng. Prog. 45, 39–48.</p>
+                    <p>Chisholm, D. (1967). "A theoretical basis for the Lockhart-Martinelli correlation for two-phase flow." Int. J. Heat Mass Transfer 10, 1767–1778.</p>
+                    <p>Haaland, S. E. (1983). "Simple and explicit formulas for the friction factor in turbulent flow." J. Fluids Eng. 105, 89–90.</p>
+                    <p>Wilke, C. R. (1950). "A viscosity equation for gas mixtures." J. Chem. Phys. 18, 517–519.</p>
+                    <p>Mandhane, J. M., Gregory, G. A., Aziz, K. (1974). "A flow pattern map for gas-liquid flow in horizontal pipes." Int. J. Multiphase Flow 1, 537–553.</p>
+                    <p>Hewitt, G. F., Roberts, D. N. (1969). "Studies of two-phase flow patterns by simultaneous X-ray and flash photography." AERE-M 2159, UK Atomic Energy Authority.</p>
+                    <p>McAdams, W. H. et al. (1942). "Vaporization inside horizontal tubes — II benzene-oil mixtures." Trans. ASME 64, 193.</p>
+                    <p>IAPWS (2007). "Revised release on the IAPWS Industrial Formulation 1997 for the Thermodynamic Properties of Water and Steam." The International Association for the Properties of Water and Steam.</p>
+                    <p>Whalley, P. B. (1996). "Two-Phase Flow and Heat Transfer." Oxford Chemistry Primers.</p>
+                    <p>Collier, J. G., Thome, J. R. (1994). "Convective Boiling and Condensation," 3rd ed., Oxford University Press.</p>
+                    <p>VDI Heat Atlas (2010). 2nd English ed., Springer-Verlag — Chapter L "Pressure drop in two-phase flow."</p>
+                  </div>
+                </details>
+
+              </div>
+            </Section>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<PressureDropCalculator />);
+</script>
+</body>
+</html>
